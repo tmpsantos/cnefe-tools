@@ -1,0 +1,274 @@
+#!/usr/bin/python
+
+import argparse
+import fnmatch
+import os
+import psycopg2
+import random
+import re
+import sqlite3
+import Levenshtein
+
+from concurrent.futures import ProcessPoolExecutor
+from unicodedata import normalize
+
+_CNEFE_DATABASE_ = "cnefe.db"
+_OSM_DATABASE_ = "dbname=gis user=postgres password=postgres host=localhost"
+
+_NUMBERS_PT_ = [
+    "ZERO",
+    "UM",
+    "DOIS",
+    "TRES",
+    "QUATRO",
+    "CINCO",
+    "SEIS",
+    "SETE",
+    "OITO",
+    "NOVE",
+    "DEZ",
+    "ONZE",
+    "DOZE",
+    "TREZE",
+    "QUATORZE",
+    "QUINZE",
+    "DEZESSEIS",
+    "DEZESSETE",
+    "DEZOITO",
+    "DEZENOVE",
+    "VINTE",
+    "VINTE E UM",
+    "VINTE E DOIS",
+    "VINTE E TRES",
+    "VINTE E QUATRO",
+    "VINTE E CINCO",
+    "VINTE E SEIS",
+    "VINTE E SETE",
+    "VINTE E OITO",
+    "VINTE E NOVE",
+    "TRINTA",
+    "TRINTA E UM",
+]
+
+# OSM data was imported using EPSG:3857 and IBGE using EPSG:4326,
+# thus the transform on the IBGE side.
+_OSM_QUERY_ = """
+    SELECT planet_osm_line.osm_id, unaccent(planet_osm_line.name) AS name FROM planet_osm_line, ibge WHERE
+        ibge.cd_geocodi = '%s' AND
+        ST_Intersects(planet_osm_line.way, ST_Transform(ST_SetSRID(ST_Envelope(ibge.geom), 4326), 900913)) = TRUE AND
+        planet_osm_line.name IS NOT NULL AND
+        planet_osm_line.highway IS NOT NULL AND
+        planet_osm_line.highway != 'footway';
+    """
+
+
+def NormalizeName(name):
+    name = name.upper()
+
+    for number in [int(i) for i in name.split() if i.isdigit()]:
+        if number > 31:
+            continue
+
+        name = name.replace(str(number), _NUMBERS_PT_[number])
+
+    return name
+
+
+def GetOSMAddressesForEntry(entry):
+    conn = psycopg2.connect(_OSM_DATABASE_)
+    cur = conn.cursor()
+
+    cur.execute(_OSM_QUERY_ % entry["ibge_census_sector"])
+    addresses = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    if not addresses:
+        return []
+
+    addresses = map(lambda x: (x[0], NormalizeName(x[1])), addresses)
+
+    return addresses
+
+
+def ScanDirectoryForTXTs(directory):
+    txt_paths = []
+
+    for root, _, filenames in os.walk(directory):
+        for filename in fnmatch.filter(filenames, "[0-9]*.TXT"):
+            txt_paths.append(os.path.join(root, filename))
+
+    return txt_paths
+
+
+def CheckForDirectory(path):
+    if not os.path.isdir(path):
+        raise argparse.ArgumentTypeError("%s is not a directory." % path)
+
+    return path
+
+
+def CreateDatabaseIfNotExists():
+    db = sqlite3.connect(_CNEFE_DATABASE_)
+    cursor = db.cursor()
+    cursor.execute("""CREATE TABLE IF NOT EXISTS cnefe(
+        state TEXT,
+        city TEXT,
+        district TEXT,
+        subdistrict TEXT,
+        sector TEXT,
+        sector_type TEXT,
+        address TEXT PRIMARY KEY,
+        neighborhood TEXT,
+        zipcode TEXT,
+        ibge_census_sector TEXT,
+        osm_id TEXT,
+        on_osm BOOL
+    )""")
+
+    db.commit()
+
+
+def ProcessEntry(entry):
+    # Build CNEFE address from entry
+    cnefe_address = entry["address"]
+
+    db = sqlite3.connect(_CNEFE_DATABASE_)
+    cursor = db.cursor()
+    cursor.execute("SELECT address FROM cnefe WHERE address = '%s'" % cnefe_address)
+
+    data = cursor.fetchone()
+    if data is not None:
+        return entry
+
+    osm_addresses = GetOSMAddressesForEntry(entry)
+
+    match = [osm_address for osm_address in osm_addresses if osm_address[1] == cnefe_address]
+    if match:
+        entry["on_osm"] = True
+        entry["osm_id"] = match[0][1]
+        return entry
+
+    osm_addresses = filter(lambda x: Levenshtein.ratio(cnefe_address, x[1]) > .9, osm_addresses)
+    if osm_addresses:
+        # The address is not on OSM but it is very similar, could be a typo
+        # on one of the sides, suggest a node to be edited.
+        entry["on_osm"] = False
+        entry["osm_id"] = osm_addresses[0][0]
+        entry["address"] = cnefe_address
+
+    return entry
+
+
+def LineToEntry(line):
+    # See Layout_Donwload.xls bundled with CNEFE
+    address_type  = line[16 :16  + 20].strip()
+    address_title = line[36 :36  + 30].strip()
+    address_name  = line[66 :66  + 60].strip()
+
+    address = address_type
+    if address_title:
+        address += " " + address_title
+    address += " " + address_name
+    address = re.sub(" +", ' ', address)
+
+    entry = {
+        "state"          : line[0  :0   + 2 ].strip(),
+        "city"           : line[2  :2   + 5 ].strip(),
+        "district"       : line[7  :7   + 2 ].strip(),
+        "subdistrict"    : line[9  :9   + 2 ].strip(),
+        "sector"         : line[11 :11  + 4 ].strip(),
+        "sector_type"    : line[15 :15  + 1 ].strip(),
+        "address"        : address,
+        "neighborhood"   : line[351:351 + 60].strip(),
+        "zipcode"        : line[550:550 + 8 ].strip(),
+    }
+
+    ibge_census_sector = \
+        entry["state"].zfill(2) + \
+        entry["city"].zfill(5) + \
+        entry["district"].zfill(2) + \
+        entry["subdistrict"].zfill(2) + \
+        entry["sector"].zfill(4)
+
+    entry["ibge_census_sector"] = ibge_census_sector
+    entry["osm_id"] = None
+    entry["on_osm"] = False
+
+    return entry
+
+
+def MakeEntriesList(txt_path):
+    entry_set = set()
+    entry_list = []
+
+    txt = open(txt_path, "r")
+    for line in txt:
+        entry = LineToEntry(line)
+
+        if (entry["sector_type"] == '2'):
+            continue
+
+        key = (entry["ibge_census_sector"], entry["address"], entry["zipcode"])
+        if key in entry_set:
+            continue
+
+        entry_set.add(key)
+        entry_list.append(entry)
+
+    # Shuffle so we don't ask for the same zipcode
+    # in sequence when running with multiple process. If
+    # one of the process validates the zipcode, the others
+    # will not try to query for it.
+    random.shuffle(entry_list)
+
+    return entry_list
+
+
+def ProcessFiles(txt_paths, jobs, verbose):
+    executor = ProcessPoolExecutor(max_workers=jobs)
+
+    db = sqlite3.connect(_CNEFE_DATABASE_)
+    cursor = db.cursor()
+    cache = {}
+
+    for txt_path in txt_paths:
+        entries = MakeEntriesList(txt_path)
+        for entry in executor.map(ProcessEntry, entries):
+            if not entry:
+                continue
+
+            columns = ", ".join(entry.keys())
+            placeholders  = ", ".join('?' * len(entry))
+            query = "REPLACE INTO cnefe (%s) VALUES (%s)" % (columns, placeholders)
+            try:
+                cursor.execute(query, entry.values())
+                db.commit()
+            except:
+                print "Invalid entry (?):", entry
+
+            if verbose:
+                print "Validated:", entry["address"]
+
+
+def Main():
+    parser = argparse.ArgumentParser(
+        description="Validates the CNEFE address database from IBGE.")
+
+    parser.add_argument("-v", action="store_true", help= "Verbose mode.")
+    parser.add_argument("--jobs", type=int, default=1, help=
+            "Number of jobs for processing TXTs.")
+    parser.add_argument("directory", nargs=1, type=CheckForDirectory, help=
+            "Directory to be recursively scanned for CNEFE files.")
+
+    args = parser.parse_args()
+    directory = args.directory[0]
+    txt_paths = ScanDirectoryForTXTs(directory)
+
+    CreateDatabaseIfNotExists()
+    ProcessFiles(txt_paths, args.jobs, args.v)
+
+
+if __name__ == "__main__":
+    Main()
